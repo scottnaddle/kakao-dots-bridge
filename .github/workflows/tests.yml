@@ -1,0 +1,36 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, cursor/** ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install SQLCipher
+      run: brew install sqlcipher
+    
+    - name: Run tests
+      run: |
+        python3 -m unittest discover -s tests -v -p 'test_*.py'
+      env:
+        PYTHONPATH: ${{ github.workspace }}/src
+    
+    - name: Check for sensitive data
+      run: |
+        # Ensure no secrets, personal data, or keys in code
+        ! grep -r "sk-[a-zA-Z0-9]" src/ tests/ || exit 1
+        ! grep -r "whsec_" src/ tests/ || exit 1
+        ! grep -ri "kakao.*password" src/ tests/ || exit 1
+        echo "No sensitive data found"

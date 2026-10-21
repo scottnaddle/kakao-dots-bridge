@@ -17,6 +17,11 @@ APP = "/Applications/KakaoTalkNew.app"
 ROOT = Path.home() / "Library/Application Support" / BUNDLE
 PREFS = Path.home() / "Library/Preferences"
 
+# Support for regular KakaoTalk.app
+BUNDLE_REGULAR = "com.kakao.KakaoTalkMac"
+APP_REGULAR = "/Applications/KakaoTalk.app"
+ROOT_REGULAR = Path.home() / "Library/Application Support" / BUNDLE_REGULAR
+
 
 class AccountError(RuntimeError):
     pass
@@ -113,22 +118,39 @@ class BusinessDB:
     def __init__(self, config):
         self.config = config
         self.uid = int(config["user_id"])
-        if config["bundle_id"] != BUNDLE or config["app_path"] != APP:
+        # Support both KakaoTalkNew.app and regular KakaoTalk.app
+        bundle = config["bundle_id"]
+        app_path = config["app_path"]
+        
+        if bundle == BUNDLE and app_path == APP:
+            self.bundle = BUNDLE
+            self.app_path = APP
+            self.root = ROOT
+        elif bundle == BUNDLE_REGULAR and app_path == APP_REGULAR:
+            self.bundle = BUNDLE_REGULAR
+            self.app_path = APP_REGULAR
+            self.root = ROOT_REGULAR
+        else:
             raise AccountError("업무 계정 고정 설정이 일치하지 않습니다.")
+        
         self.expected_hash = hashlib.sha512(str(self.uid).encode()).hexdigest()
         self.path, self.key = derive(self.uid)
-        if self.path.resolve() != Path(config["database"]).resolve() or self.path.parent.resolve() != ROOT.resolve():
+        if self.path.resolve() != Path(config["database"]).resolve() or self.path.parent.resolve() != self.root.resolve():
             raise AccountError("업무용 DB 경로가 일치하지 않습니다.")
 
     def guard(self):
         if active_hash() != self.expected_hash:
             raise AccountError("카카오톡 업무 계정이 바뀌었습니다. 수집과 전송을 중단합니다.")
         if not self.path.is_file(): raise AccountError("업무용 DB가 없습니다.")
-        with open(Path(APP) / "Contents/Info.plist", "rb") as f:
-            if plistlib.load(f).get("CFBundleIdentifier") != BUNDLE:
+        with open(Path(self.app_path) / "Contents/Info.plist", "rb") as f:
+            if plistlib.load(f).get("CFBundleIdentifier") != self.bundle:
                 raise AccountError("업무용 앱 식별자가 바뀌었습니다.")
         processes = subprocess.check_output(["/bin/ps", "-axo", "pid=,comm="], text=True)
-        expected_exe = APP + "/Contents/MacOS/KakaoTalkDev"
+        # Determine expected executable based on bundle
+        if self.bundle == BUNDLE:
+            expected_exe = APP + "/Contents/MacOS/KakaoTalkDev"
+        else:
+            expected_exe = APP_REGULAR + "/Contents/MacOS/KakaoTalk"
         pids = [line.strip().split(None, 1)[0] for line in processes.splitlines()
                 if len(line.strip().split(None, 1)) == 2 and line.strip().split(None, 1)[1] == expected_exe]
         if len(pids) != 1:

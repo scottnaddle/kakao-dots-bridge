@@ -66,6 +66,22 @@ class Bridge:
             self.secret_path.write_text(secrets.token_urlsafe(40)); self.secret_path.chmod(0o600)
         self.secret = self.secret_path.read_text().strip()
         self.url = f"http://127.0.0.1:{self.config['port']}"
+        # Grok Bot support
+        from grok_events import GrokEvents
+        from grok_mcp import RoomFilter
+        webhook_secret_path = self.runtime / "grok-webhook-secret"
+        if not webhook_secret_path.exists():
+            webhook_secret_path.write_text(secrets.token_urlsafe(40))
+            webhook_secret_path.chmod(0o600)
+        webhook_secret = webhook_secret_path.read_text().strip()
+        self.grok = GrokEvents(
+            self.runtime,
+            webhook_url=self.config.get("grok_webhook_url", ""),
+            webhook_secret=webhook_secret,
+            batch_window_seconds=self.config.get("grok_batch_window_seconds", 3.0),
+            daily_event_cap=self.config.get("grok_daily_event_cap", 1000)
+        )
+        self.grok_filter = RoomFilter(self.runtime)
 
     def audit(self, event, details):
         with self.mutex:
@@ -207,6 +223,9 @@ class Bridge:
                 self.save(cid,entry)
                 self.notifier("새 업무 메시지", c["name"] + "에서 메시지가 왔습니다.", cid)
                 if dots_active and c["can_draft"] and m["message_type"]==1:self.dots.enqueue(m)
+                # Grok Bot event delivery
+                if self.config.get("grok_enabled") and c["can_draft"] and m["message_type"]==1 and self.grok_filter.is_allowed(cid):
+                    self.grok.enqueue(cid, m["message_id"], m["sent_at"])
                 if should_draft and not dots_active:
                     self.pending[cid] = time.monotonic() + 5
         self.last_poll = now(); self.error = None
@@ -337,6 +356,95 @@ class Bridge:
             try:self.dots.deliver_one(self.dots_delivery_allowed)
             except Exception:pass  # Delivery state is durable; no secrets enter service logs.
             time.sleep(0.5)
+
+    def run_grok_delivery(self):
+        """Deliver Grok Bot webhook events."""
+        while True:
+            try:
+                self.grok.deliver_one(lambda cid: self.grok_filter.is_allowed(cid))
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+    def grok_enabled(self):
+        """Check if Grok Bot access is enabled."""
+        if not self.config.get("grok_enabled", False):
+            raise ValueError("Grok Bot access is not enabled")
+        self.db.guard()
+
+    def grok_status(self):
+        """Get Grok Bot status."""
+        self.grok_enabled()
+        stats = self.grok.stats()
+        return {
+            "enabled": True,
+            "allowlist_size": len(self.grok_filter.load_allowlist()),
+            "webhook_configured": stats["webhook_configured"],
+            "daily_count": stats["daily_count"],
+            "daily_cap": stats["daily_cap"],
+            "pending_deliveries": stats["pending"],
+            "mode": "read_and_draft_only"
+        }
+
+    def grok_chats(self):
+        """List all chats for Grok Bot filtering."""
+        self.grok_enabled()
+        all_chats = self.chats()
+        # Return metadata only, no message content
+        return [
+            {
+                "chat_id": c["chat_id"],
+                "name": c["name"],
+                "type": c["type"],
+                "member_count": c.get("member_count", 0),
+                "can_draft": c["can_draft"],
+                "muted": c["muted"],
+                "is_allowed": self.grok_filter.is_allowed(c["chat_id"])
+            }
+            for c in all_chats
+            if c["type"] != 5 and c["type"] != 9999  # Exclude self-chat and channels
+        ]
+
+    def grok_context(self, cid):
+        """Get context for Grok Bot (allowlist enforced)."""
+        self.grok_enabled()
+        if not self.grok_filter.is_allowed(cid):
+            raise ValueError("Room not in allowlist")
+        context = self.draft_context(cid)
+        # Filter to text messages only, remove internal IDs
+        context["messages"] = [
+            {k: m.get(k) for k in ("sender", "text", "is_from_me", "sent_at", "message_type")}
+            for m in context["messages"]
+            if m["message_type"] == 1
+        ]
+        return context
+
+    def grok_save(self, body):
+        """Save draft from Grok Bot (allowlist enforced)."""
+        self.grok_enabled()
+        cid = str(body["chat_id"])
+        if not self.grok_filter.is_allowed(cid):
+            raise ValueError("Room not in allowlist")
+        if not self.config.get("auto_draft") or self.config.get("paused"):
+            raise ValueError("Auto draft is disabled or paused")
+        result = self.save_host_draft(cid, body["text"], body["summary"], body["fingerprint"], source="grok")
+        self.audit("grok_draft_saved", {"chat_id": cid, "sent": False})
+        return result
+
+    def grok_update_allowlist(self, body):
+        """Update room allowlist."""
+        self.grok_enabled()
+        room_ids = body.get("room_ids", [])
+        if not isinstance(room_ids, list):
+            raise ValueError("room_ids must be a list")
+        # Validate all rooms exist and are valid
+        all_chats = self.chats()
+        valid_ids = {c["chat_id"] for c in all_chats if c["type"] not in (5, 9999) and c["can_draft"]}
+        for rid in room_ids:
+            if str(rid) not in valid_ids:
+                raise ValueError(f"Invalid or inaccessible room: {rid}")
+        self.grok_filter.save_allowlist(room_ids)
+        return {"updated": True, "count": len(room_ids)}
 
     def dispatch_host_due(self, due):
         consumed=False
@@ -594,6 +702,8 @@ def serve(b):
                     current=b.status();result={k:current[k] for k in ("profile","business_only","connected","paused","auto_draft","dots")}
                 elif parsed.path=="/api/dots/chats": result=b.dots_chats()
                 elif parsed.path=="/api/dots/inbox": result=b.dots_inbox()
+                elif parsed.path=="/api/grok/status": result=b.grok_status()
+                elif parsed.path=="/api/grok/chats": result=b.grok_chats()
                 elif parsed.path=="/api/inbox": result=b.items()
                 elif parsed.path=="/api/chats": result=b.chats()
                 elif parsed.path=="/api/messages":
@@ -617,6 +727,9 @@ def serve(b):
                 elif self.path=="/api/dots/poll": result=b.dots_poll()
                 elif self.path=="/api/dots/claim-auto": result=b.dots_claim_auto(body)
                 elif self.path=="/api/dots/release-auto": result=b.dots_release_auto()
+                elif self.path=="/api/grok/context": result=b.grok_context(str(body["chat_id"]))
+                elif self.path=="/api/grok/save": result=b.grok_save(body)
+                elif self.path=="/api/grok/allowlist": result=b.grok_update_allowlist(body)
                 elif self.path=="/api/test-notification":
                     b.notify("설정 테스트","업무용 카카오톡의 수신 알림이 연결됐습니다.","setup")
                     result=b.kv("notification_attempt")
@@ -651,6 +764,7 @@ def serve(b):
     except Exception as e: b.error=str(e)
     threading.Thread(target=b.run_watcher,daemon=True).start()
     threading.Thread(target=b.run_dots_delivery,daemon=True).start()
+    threading.Thread(target=b.run_grok_delivery,daemon=True).start()
     server=ThreadingHTTPServer(("127.0.0.1",b.config["port"]),Handler)
     print(encode({"started":now(),"business_only":True,"url":b.url}),flush=True)
     server.serve_forever()
@@ -713,12 +827,15 @@ def mcp():
 
 if __name__=="__main__":
     os.umask(0o077)
-    parser=argparse.ArgumentParser();parser.add_argument("command",choices=["serve","mcp","dots-mcp","status","chats","inbox","draft","messages","auto-context","auto-save","auto-finish"]);parser.add_argument("chat_id",nargs="?")
+    parser=argparse.ArgumentParser();parser.add_argument("command",choices=["serve","mcp","dots-mcp","grok-mcp","status","chats","inbox","draft","messages","auto-context","auto-save","auto-finish"]);parser.add_argument("chat_id",nargs="?")
     args=parser.parse_args()
     if args.command=="serve": serve(Bridge())
     elif args.command=="mcp": mcp()
     elif args.command=="dots-mcp":
         from dots_mcp import stdio
+        stdio()
+    elif args.command=="grok-mcp":
+        from grok_mcp import stdio
         stdio()
     elif args.command in ("status","chats","inbox"): print(encode(client("GET","/api/"+args.command)))
     elif args.command=="auto-context":print(encode(client("GET","/api/auto-context")))
