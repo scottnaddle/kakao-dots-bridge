@@ -94,19 +94,33 @@ Configuration options:
 - `grok_daily_event_cap`: Maximum events per day to prevent excessive usage (default: 1000)
 - `mcp_bind_address`: Network interface to bind MCP server (default: 127.0.0.1)
 
-### 4. Set Up Tailscale (Recommended)
+### 4. Set Up Tailscale (Required for Remote Grok Bot)
 
-For secure private network access:
+If Grok Bot runs on a remote Linux box (not the same Mac), you need Tailscale:
+
+**On Mac (MCP Server)**:
 
 1. Install Tailscale: `brew install tailscale`
-2. Start Tailscale: `sudo tailscaled`
+2. Start daemon: `sudo tailscaled`
 3. Authenticate: `tailscale up`
-4. Get your Tailscale IP: `tailscale ip -4`
-5. Update `config.json` to bind to Tailscale interface if desired
+4. Get your IP: `tailscale ip -4`
+5. Start HTTP MCP: `python3 src/bridge.py grok-mcp-http --bind $(tailscale ip -4) --port 3000`
+
+**On Linux (Grok Bot)**:
+
+1. Install: `curl -fsSL https://tailscale.com/install.sh | sh`
+2. Authenticate: `tailscale up`
+3. Test connection: `curl -H "Authorization: Bearer $(cat runtime/grok-mcp-token)" http://MAC_TAILSCALE_IP:3000/health`
+
+If Grok Bot runs on the same Mac, use stdio transport instead (no Tailscale needed).
 
 ### 5. Configure Grok Bot MCP Connection
 
-The MCP server is accessible via stdio only:
+The MCP server supports two transports:
+
+#### Option A: stdio (Local Mac Only)
+
+For Grok Bot running on the same Mac:
 
 ```bash
 python3 src/bridge.py grok-mcp
@@ -114,7 +128,93 @@ python3 src/bridge.py grok-mcp
 
 Configure this as a stdio MCP server in your Grok Bot/MCP client.
 
-**Security**: Never expose the MCP server over HTTP without authentication. Use stdio or bind to a private network interface only.
+#### Option B: HTTP/SSE (Remote Grok Bot)
+
+For Grok Bot running on a remote Linux box, use HTTP transport over Tailscale.
+
+**Security**: The HTTP server refuses to bind to `0.0.0.0` or public IPs without an explicit `--allow-unsafe` flag (NOT RECOMMENDED).
+
+**Allowed bind addresses**:
+- `127.0.0.1` (localhost only, default)
+- Tailscale IPs: `100.64.0.0/10` (IPv4) or `fd7a:115c:a1e0::/48` (IPv6)
+
+**Setup steps**:
+
+1. Install and configure Tailscale on your Mac:
+   ```bash
+   brew install tailscale
+   sudo tailscaled
+   tailscale up
+   ```
+
+2. Get your Mac's Tailscale IP:
+   ```bash
+   tailscale ip -4
+   # Example output: 100.64.1.23
+   ```
+
+3. Start HTTP MCP server bound to Tailscale interface:
+   ```bash
+   python3 src/bridge.py grok-mcp-http --bind 100.64.1.23 --port 3000
+   ```
+
+   This will output:
+   ```json
+   {
+     "transport": "http-mcp",
+     "address": "http://100.64.1.23:3000",
+     "endpoints": {
+       "health": "/health",
+       "mcp": "/mcp",
+       "sse": "/sse"
+     },
+     "auth": "bearer-token-required",
+     "binding": "safe"
+   }
+   ```
+
+4. Copy the MCP token from your Mac:
+   ```bash
+   cat runtime/grok-mcp-token
+   ```
+
+5. On your remote Linux box where Grok Bot runs, configure the MCP connection:
+   - **Transport**: HTTP
+   - **URL**: `http://100.64.1.23:3000/mcp` (use your Mac's Tailscale IP)
+   - **Authentication**: Bearer token
+   - **Token**: Paste token from step 4
+
+6. Test the connection from Linux box:
+   ```bash
+   # Install Tailscale on Linux box
+   curl -fsSL https://tailscale.com/install.sh | sh
+   tailscale up
+   
+   # Test health endpoint
+   curl -H "Authorization: Bearer YOUR_TOKEN_HERE" \
+     http://100.64.1.23:3000/health
+   
+   # Should return: {"status":"healthy","mcp":"grok-bot"}
+   ```
+
+**Token Security**: The token is auto-generated and stored in `runtime/grok-mcp-token` with 0600 permissions. Never commit it to git. Rotate by deleting the file and restarting the server.
+
+**Firewall**: No firewall configuration needed - Tailscale creates an encrypted WireGuard tunnel. Only devices on your Tailnet can reach the MCP server.
+
+**Network Binding Safety**:
+- ✅ `127.0.0.1` - Localhost only (default)
+- ✅ `100.64.x.x` - Tailscale (safe, encrypted)
+- ❌ `0.0.0.0` - All interfaces (REFUSED by default)
+- ❌ `192.168.x.x` - Private LAN (REFUSED by default)
+- ❌ Public IPs - (REFUSED by default)
+
+To override safety checks (NOT RECOMMENDED):
+```bash
+python3 src/bridge.py grok-mcp-http --bind 0.0.0.0 --port 3000 --allow-unsafe
+# WARNING: Exposes MCP to entire network. Use only for testing.
+```
+
+**SSE Support**: The `/sse` endpoint is available for future event streaming but not currently used by the MCP protocol.
 
 ## Testing
 
