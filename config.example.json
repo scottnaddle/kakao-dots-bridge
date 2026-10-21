@@ -17,5 +17,10 @@
   "blocked_chat_ids": [],
   "chat_aliases": {},
   "codex_path": "",
-  "codex_thread_id": null
+  "codex_thread_id": null,
+  "grok_enabled": false,
+  "grok_webhook_url": "",
+  "grok_batch_window_seconds": 3.0,
+  "grok_daily_event_cap": 1000,
+  "mcp_bind_address": "127.0.0.1"
 }

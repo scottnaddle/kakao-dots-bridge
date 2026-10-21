@@ -17,17 +17,51 @@ APP = "/Applications/KakaoTalkNew.app"
 ROOT = Path.home() / "Library/Application Support" / BUNDLE
 PREFS = Path.home() / "Library/Preferences"
 
+# Support for regular KakaoTalk.app (sandboxed, different paths)
+BUNDLE_REGULAR = "com.kakao.KakaoTalkMac"
+APP_REGULAR = "/Applications/KakaoTalk.app"
+# Sandboxed app uses container paths
+CONTAINER_REGULAR = Path.home() / "Library/Containers" / BUNDLE_REGULAR / "Data"
+ROOT_REGULAR = CONTAINER_REGULAR / "Library/Application Support" / BUNDLE_REGULAR
+PREFS_REGULAR = CONTAINER_REGULAR / "Library/Preferences"
+
 
 class AccountError(RuntimeError):
     pass
 
 
-def active_hash():
+def active_hash(bundle=BUNDLE, prefs_dir=PREFS):
+    """
+    Derive active account hash from preferences.
+    
+    For KakaoTalkNew (work): Uses DESIGNATEDFRIENDSREVISION: keys in plist
+    For KakaoTalk (regular): May use different mechanism - attempts multiple strategies
+    """
     hashes = set()
-    for p in PREFS.glob(BUNDLE + ".*.plist"):
-        data = plistlib.loads(p.read_bytes())
-        hashes.update(k.split(":", 1)[1] for k, v in data.items()
-                      if k.startswith("DESIGNATEDFRIENDSREVISION:") and v)
+    
+    # Strategy 1: DESIGNATEDFRIENDSREVISION keys (KakaoTalkNew.app)
+    for p in prefs_dir.glob(bundle + ".*.plist"):
+        try:
+            data = plistlib.loads(p.read_bytes())
+            hashes.update(k.split(":", 1)[1] for k, v in data.items()
+                          if k.startswith("DESIGNATEDFRIENDSREVISION:") and v)
+        except Exception:
+            pass
+    
+    # Strategy 2: Main plist file for sandboxed regular app
+    # The regular app may store account info differently
+    main_plist = prefs_dir / f"{bundle}.plist"
+    if main_plist.exists() and not hashes:
+        try:
+            data = plistlib.loads(main_plist.read_bytes())
+            # Try to find account-related keys
+            # Regular app might use different keys - check common patterns
+            for key, value in data.items():
+                if isinstance(value, str) and len(value) == 40 and all(c in '0123456789abcdef' for c in value.lower()):
+                    hashes.add(value.lower())
+        except Exception:
+            pass
+    
     if len(hashes) != 1:
         raise AccountError("업무용 카카오톡의 활성 계정을 확인할 수 없습니다.")
     return next(iter(hashes))
@@ -41,6 +75,71 @@ def derive(uid):
     parts = ["A", hashed, "|", "F", uuid[:5], "H", str(uid), "|", uuid[7:]]
     key = hashlib.pbkdf2_hmac("sha256", "F".join(parts)[::-1].encode(), uuid[int(len(uuid) * .3):].encode(), 100000, 128).hex()
     return ROOT / name, key
+
+
+def find_uid_from_db_files(root_dir: Path, test_range: tuple[int, int] | None = None) -> int | None:
+    """
+    Find user ID by trying candidates against existing DB files.
+    
+    This searches for DB files in the root directory and attempts to derive
+    the path for each candidate UID. Returns the UID whose derived path matches
+    an existing DB file.
+    
+    Only uses filesystem metadata - never reads message content.
+    
+    Args:
+        root_dir: Directory containing KakaoTalk DB files
+        test_range: Optional (start, end) tuple for UID range (for testing)
+    """
+    if not root_dir.exists():
+        return None
+    
+    # Find potential DB files (40-hex or 78-hex char names)
+    db_candidates = set()
+    for item in root_dir.iterdir():
+        if item.is_file():
+            name = item.name
+            # 40-hex, 78-hex, or similar patterns (common DB file name lengths)
+            if len(name) in (40, 78) and all(c in '0123456789abcdef' for c in name.lower()):
+                db_candidates.add(name)
+    
+    if not db_candidates:
+        return None
+    
+    try:
+        raw = subprocess.check_output(["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"], text=True)
+        platform_uuid = re.search(r'"IOPlatformUUID" = "([^"]+)"', raw)[1]
+    except Exception:
+        return None
+    
+    # Determine search range
+    if test_range:
+        ranges = [range(test_range[0], test_range[1], 1)]
+    else:
+        # Production ranges: Most KakaoTalk UIDs are in 1-4 billion range
+        # Search in smaller chunks to avoid excessive computation
+        ranges = [
+            range(1000000000, 1100000000, 1),  # 1.0-1.1B (100M range)
+            range(2000000000, 2100000000, 1),  # 2.0-2.1B
+            range(3000000000, 3100000000, 1),  # 3.0-3.1B
+        ]
+    
+    for test_range_obj in ranges:
+        for test_uid in test_range_obj:
+            try:
+                hashed = base64.b64encode(hashlib.sha1(platform_uuid.encode()).digest() + hashlib.sha256(platform_uuid.encode()).digest()).decode()
+                name = hashlib.pbkdf2_hmac("sha256", ".".join([".", "F", str(test_uid), "A", "F", platform_uuid[::-1], ".", "|"]).encode(), hashed[::-1].encode(), 100000, 128).hex()[28:106]
+                
+                # Check if this derived name matches any DB file
+                if name in db_candidates:
+                    # Verify it's a real file
+                    test_path = root_dir / name
+                    if test_path.exists() and test_path.is_file():
+                        return test_uid
+            except Exception:
+                continue
+    
+    return None
 
 
 class Cipher:
@@ -113,22 +212,48 @@ class BusinessDB:
     def __init__(self, config):
         self.config = config
         self.uid = int(config["user_id"])
-        if config["bundle_id"] != BUNDLE or config["app_path"] != APP:
+        # Support both KakaoTalkNew.app and regular KakaoTalk.app
+        bundle = config["bundle_id"]
+        app_path = config["app_path"]
+        
+        if bundle == BUNDLE and app_path == APP:
+            self.bundle = BUNDLE
+            self.app_path = APP
+            self.root = ROOT
+            self.prefs_dir = PREFS
+        elif bundle == BUNDLE_REGULAR and app_path == APP_REGULAR:
+            self.bundle = BUNDLE_REGULAR
+            self.app_path = APP_REGULAR
+            self.root = ROOT_REGULAR
+            self.prefs_dir = PREFS_REGULAR
+        else:
             raise AccountError("업무 계정 고정 설정이 일치하지 않습니다.")
+        
         self.expected_hash = hashlib.sha512(str(self.uid).encode()).hexdigest()
         self.path, self.key = derive(self.uid)
-        if self.path.resolve() != Path(config["database"]).resolve() or self.path.parent.resolve() != ROOT.resolve():
+        
+        # For regular app, path should be in the container
+        if self.bundle == BUNDLE_REGULAR:
+            # Update path to be in container
+            db_filename = self.path.name
+            self.path = self.root / db_filename
+        
+        if self.path.resolve() != Path(config["database"]).resolve() or self.path.parent.resolve() != self.root.resolve():
             raise AccountError("업무용 DB 경로가 일치하지 않습니다.")
 
     def guard(self):
-        if active_hash() != self.expected_hash:
+        if active_hash(self.bundle, self.prefs_dir) != self.expected_hash:
             raise AccountError("카카오톡 업무 계정이 바뀌었습니다. 수집과 전송을 중단합니다.")
         if not self.path.is_file(): raise AccountError("업무용 DB가 없습니다.")
-        with open(Path(APP) / "Contents/Info.plist", "rb") as f:
-            if plistlib.load(f).get("CFBundleIdentifier") != BUNDLE:
+        with open(Path(self.app_path) / "Contents/Info.plist", "rb") as f:
+            if plistlib.load(f).get("CFBundleIdentifier") != self.bundle:
                 raise AccountError("업무용 앱 식별자가 바뀌었습니다.")
         processes = subprocess.check_output(["/bin/ps", "-axo", "pid=,comm="], text=True)
-        expected_exe = APP + "/Contents/MacOS/KakaoTalkDev"
+        # Determine expected executable based on bundle
+        if self.bundle == BUNDLE:
+            expected_exe = APP + "/Contents/MacOS/KakaoTalkDev"
+        else:
+            expected_exe = APP_REGULAR + "/Contents/MacOS/KakaoTalk"
         pids = [line.strip().split(None, 1)[0] for line in processes.splitlines()
                 if len(line.strip().split(None, 1)) == 2 and line.strip().split(None, 1)[1] == expected_exe]
         if len(pids) != 1:

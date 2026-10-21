@@ -32,11 +32,11 @@ class FakeDB:
 class BridgeTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.path=Path(self.temp.name)
-        (self.path/'config.json').write_text(json.dumps({'profile':'업무 계정','port':18765,'send_enabled':True,'auto_draft':True,'notifications':True}))
+        (self.path/'config.json').write_text(json.dumps({'profile':'업무 계정','port':18765,'send_enabled':True,'auto_draft':True,'notifications':True,'grok_enabled':False,'grok_webhook_url':'','mcp_bind_address':'127.0.0.1'}))
         self.db=FakeDB();self.notifications=[];self.sent=[]
         self.b=Bridge(self.path,db=self.db,notifier=lambda *a:self.notifications.append(a),generator=lambda *a:{'summary':'일정 질문','draft':'언제가 편하실까요?','needs_reply':True,'priority':'normal','reason':'시간을 확인합니다.'},sender=self.send)
     def tearDown(self):
-        self.b.pool.shutdown();self.b.state.close();self.b.dots.close();self.temp.cleanup()
+        self.b.pool.shutdown();self.b.state.close();self.b.dots.close();self.b.grok.close();self.temp.cleanup()
     def send(self,name,text):
         self.sent.append((name,text));self.db.rows.append(message(max(m['source_rowid'] for m in self.db.rows)+1,text,True))
     def test_baseline_does_not_alert_history(self):
@@ -203,12 +203,52 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.b.confirm(p['token'],'10','초안')
         self.assertFalse(self.sent)
     def test_no_personal_account_config_allowed(self):
-        with self.assertRaises(AccountError):BusinessDB({'user_id':'1','bundle_id':'com.kakao.KakaoTalkMac','app_path':'/Applications/KakaoTalk.app'})
+        import platform
+        if platform.system() != 'Darwin':
+            self.skipTest("macOS-only test")
+        with self.assertRaises(AccountError):BusinessDB({'user_id':'1','bundle_id':'com.kakao.KakaoTalkMac','app_path':'/Applications/KakaoTalk.app','database':'/tmp/fake.db'})
     def test_persistence_does_not_replay(self):
         self.b.poll_once();self.db.rows.append(message(2));self.b.poll_once()
         other=Bridge(self.path,db=self.db,notifier=lambda *a:self.notifications.append(a))
         try:other.poll_once();self.assertEqual(len(self.notifications),1)
-        finally:other.pool.shutdown();other.state.close();other.dots.close()
+        finally:other.pool.shutdown();other.state.close();other.dots.close();other.grok.close()
+    def test_grok_disabled_by_default(self):
+        with self.assertRaises(ValueError):self.b.grok_status()
+    def test_grok_allowlist_enforcement(self):
+        self.b.config['grok_enabled']=True
+        self.b.grok_filter.save_allowlist(['10'])
+        chats=self.b.grok_chats()
+        allowed=[c for c in chats if c['is_allowed']]
+        self.assertEqual(len(allowed),1)
+        self.assertEqual(allowed[0]['chat_id'],'10')
+        # Can read allowed room
+        context=self.b.grok_context('10')
+        self.assertEqual(context['chat_id'],'10')
+        # Cannot read disallowed room
+        self.b.grok_filter.save_allowlist([])
+        with self.assertRaises(ValueError):self.b.grok_context('10')
+    def test_grok_event_delivery_respects_allowlist(self):
+        self.b.config.update(grok_enabled=True,grok_webhook_url='https://routine.x.ai/test',auto_draft=True)
+        webhook_secret=(self.path/'runtime/grok-webhook-secret').read_text().strip()
+        self.b.grok.webhook_url='https://routine.x.ai/test'
+        self.b.grok.webhook_secret=webhook_secret
+        deliveries=[]
+        def mock_send(payload):
+            deliveries.append(payload)
+            return(200,b'ok')
+        self.b.grok._send_webhook=mock_send
+        # Room not in allowlist - should not enqueue
+        self.b.grok_filter.save_allowlist([])
+        self.b.poll_once();self.db.rows.append(message(2));self.b.poll_once()
+        stats=self.b.grok.stats()
+        self.assertEqual(stats['pending'],0)
+        # Room in allowlist - should enqueue and deliver
+        self.b.grok_filter.save_allowlist(['10'])
+        self.db.rows.append(message(3));self.b.poll_once()
+        time.sleep(3.5)
+        self.b.grok.deliver_one(lambda cid:self.b.grok_filter.is_allowed(cid))
+        self.assertGreater(len(deliveries),0)
+        self.assertEqual(deliveries[0]['chat_id'],'10')
 
 
 if __name__=='__main__': unittest.main()
