@@ -827,10 +827,11 @@ def mcp():
 
 if __name__=="__main__":
     os.umask(0o077)
-    parser=argparse.ArgumentParser();parser.add_argument("command",choices=["serve","mcp","dots-mcp","grok-mcp","grok-mcp-http","status","chats","inbox","draft","messages","auto-context","auto-save","auto-finish"]);parser.add_argument("chat_id",nargs="?")
+    parser=argparse.ArgumentParser();parser.add_argument("command",choices=["serve","mcp","dots-mcp","grok-mcp","grok-mcp-http","find-uid","status","chats","inbox","draft","messages","auto-context","auto-save","auto-finish"]);parser.add_argument("chat_id",nargs="?")
     parser.add_argument("--bind",default="127.0.0.1",help="Bind address for HTTP MCP (default: 127.0.0.1)")
     parser.add_argument("--port",type=int,default=3000,help="Port for HTTP MCP (default: 3000)")
     parser.add_argument("--allow-unsafe",action="store_true",help="Allow unsafe bind addresses (NOT RECOMMENDED)")
+    parser.add_argument("--bundle",default="com.kakao.KakaoTalkDevMac",help="Bundle ID (default: work app)")
     args=parser.parse_args()
     if args.command=="serve": serve(Bridge())
     elif args.command=="mcp": mcp()
@@ -843,6 +844,16 @@ if __name__=="__main__":
     elif args.command=="grok-mcp-http":
         from grok_mcp_http import serve_http
         serve_http(client, RUNTIME, bind_address=args.bind, port=args.port, allow_unsafe=args.allow_unsafe)
+    elif args.command=="find-uid":
+        from kakao_db import find_uid_from_db_files, ROOT, ROOT_REGULAR, BUNDLE_REGULAR
+        root = ROOT_REGULAR if args.bundle == BUNDLE_REGULAR else ROOT
+        uid = find_uid_from_db_files(root)
+        if uid:
+            print(uid)
+            sys.exit(0)
+        else:
+            print("Could not determine UID from DB files", file=sys.stderr)
+            sys.exit(1)
     elif args.command in ("status","chats","inbox"): print(encode(client("GET","/api/"+args.command)))
     elif args.command=="auto-context":print(encode(client("GET","/api/auto-context")))
     elif args.command in ("auto-save","auto-finish"):print(encode(client("POST","/api/"+args.command,json.load(sys.stdin))))
